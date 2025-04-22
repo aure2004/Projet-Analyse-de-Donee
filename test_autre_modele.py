@@ -8,6 +8,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.decomposition import PCA
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import GridSearchCV
+
 
 # Chargement des données
 airbnb = pd.read_csv("airbnb_train.csv")
@@ -63,9 +66,17 @@ preprocessor = ColumnTransformer([
     ('cat', categorical_transformer, categorical_columns)
 ])
 
+# Pipeline avec Gradient Boosting avec des hyperparamètres définis manuellement
 model = Pipeline([
     ('preprocessor', preprocessor),
-    ('regressor', LinearRegression())
+    ('regressor', GradientBoostingRegressor(
+        n_estimators=200,       # Nombre d'arbres
+        learning_rate=0.05,     # Taux d'apprentissage
+        max_depth=5,            # Profondeur maximale des arbres
+        min_samples_split=5,    # Nombre minimal d'échantillons pour diviser un nœud
+        min_samples_leaf=2,     # Nombre minimal d'échantillons dans une feuille
+        random_state=42         # Pour la reproductibilité
+    ))
 ])
 
 # Split
@@ -74,6 +85,9 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_
 cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2')
 print(f"Scores de validation croisée : {cv_scores}")
 print(f"R² moyen (validation croisée) : {np.mean(cv_scores):.4f}")
+
+
+
 
 # Entraînement
 model.fit(X_train, y_train)
@@ -125,4 +139,4 @@ def estConforme(monFichier_csv):
     print("Fichier conforme!")
 
 estConforme("MaPredictionFinale.csv")
-print("projet fini")
+
