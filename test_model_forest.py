@@ -1,122 +1,161 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import cross_val_score
+from xgboost import XGBRegressor
+import scipy.stats as stats
 
+# 1. Chargement des données d'entraînement
+train_df = pd.read_csv("airbnb_train.csv")
+if "log_price" not in train_df.columns:
+    raise KeyError("La colonne 'log_price' est manquante dans airbnb_train.csv")
 
-
-# Chargement des données
-airbnb = pd.read_csv("airbnb_train.csv")
-
-# Création de log_price si absent
-if "log_price" not in airbnb.columns:
-    airbnb["log_price"] = np.log1p(airbnb["price"])
-
-# Traitement des amenities
-def process_amenities_column(df, top_n=20):
+# 2. Extraction des amenities (top 20)
+def process_amenities(df, top_n=20):
     df = df.copy()
     df["amenities"] = df["amenities"].fillna("[]")
-    all_amenities = df["amenities"].str.replace(r"[{}\"]", "", regex=True).str.split(",")
-    amenities_flat = [item.strip() for sublist in all_amenities for item in sublist]
-    top_amenities = pd.Series(amenities_flat).value_counts().head(top_n).index.tolist()
-    for amenity in top_amenities:
-        df[f"amenity_{amenity}"] = all_amenities.apply(lambda x: int(amenity in x))
-    return df, [f"amenity_{a}" for a in top_amenities]
+    cleaned = (
+        df["amenities"]
+        .str.replace(r"[{}\"]", "", regex=True)
+        .str.split(",")
+        .apply(lambda lst: [x.strip() for x in lst if x.strip()])
+    )
+    flat = [a for sub in cleaned for a in sub]
+    top = pd.Series(flat).value_counts().head(top_n).index.tolist()
+    for amen in top:
+        df[f"amenity_{amen}"] = cleaned.apply(lambda x: int(amen in x))
+    return df, [f"amenity_{amen}" for amen in top]
 
-# Application à l'entraînement
-airbnb, amenity_columns = process_amenities_column(airbnb, top_n=20)
+train_df, amenity_cols = process_amenities(train_df, top_n=20)
 
-# Sélection des colonnes
-selected_columns = [
-    "accommodates", "bedrooms", "beds", "bed_type", "room_type", "bathrooms",
-    "cleaning_fee", "city", "review_scores_rating", "instant_bookable",
-    "cancellation_policy", "property_type",
-] + amenity_columns
+# 3. Sélection des features de base
+base_feats = [
+    "accommodates", "bedrooms", "beds", "bathrooms",
+    "cleaning_fee", "review_scores_rating",
+    "instant_bookable", "cancellation_policy",
+    "room_type", "property_type", "city"
+]
 
-X = airbnb[selected_columns]
-y = airbnb["log_price"]
+# 3.1 Création de nouvelles features combinées
+train_df["accommodates_per_bathroom"] = train_df["accommodates"] / (train_df["bathrooms"] + 1e-6)
+train_df["bedrooms_per_accommodates"] = train_df["bedrooms"] / (train_df["accommodates"] + 1e-6)
+train_df["beds_per_bedroom"] = train_df["beds"] / (train_df["bedrooms"] + 1e-6)
+train_df["price_per_accommodate"] = train_df["cleaning_fee"] / (train_df["accommodates"] + 1e-6)
+train_df["bathrooms_per_bedroom"] = train_df["bathrooms"] / (train_df["bedrooms"] + 1e-6)
+train_df["log_bedrooms"] = np.log1p(train_df["bedrooms"])
+train_df["log_accommodates"] = np.log1p(train_df["accommodates"])
+train_df["log_bathrooms"] = np.log1p(train_df["bathrooms"])
+train_df["cleaning_fee_indicator"] = (train_df["cleaning_fee"] > 0).astype(int)
+train_df["has_reviews"] = (train_df["review_scores_rating"] > 0).astype(int)
+train_df["is_shared_room"] = (train_df["room_type"] == "Shared room").astype(int)
 
-# Séparation des colonnes numériques / catégoriques
-numerical_columns = ["accommodates", "bedrooms", "beds", "bathrooms", "review_scores_rating"] + amenity_columns
-categorical_columns = list(set(selected_columns) - set(numerical_columns))
+# Regrouper les catégories rares dans 'city'
+rare_cities = train_df["city"].value_counts()[train_df["city"].value_counts() < 50].index
+train_df["city"] = train_df["city"].replace(rare_cities, "Other")
 
-# Pipelines
-numerical_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='median')),
-    ('scaler', StandardScaler())
+# Ajouter les nouvelles colonnes aux features
+combined_feats = [
+    "accommodates_per_bathroom", "bedrooms_per_accommodates",
+    "beds_per_bedroom", "price_per_accommodate", "bathrooms_per_bedroom",
+    "log_bedrooms", "log_accommodates", "log_bathrooms",
+    "cleaning_fee_indicator", "has_reviews", "is_shared_room"
+]
+features = base_feats + amenity_cols + combined_feats
+target = "log_price"
+
+# 4. Split train/validation
+X_train, X_val, y_train, y_val = train_test_split(
+    train_df[features], train_df[target], test_size=0.2, random_state=42
+)
+
+# 5. Construction du préprocesseur
+num_feats = [col for col in features if train_df[col].dtype in ["int64", "float64"]]
+cat_feats = [col for col in features if col not in num_feats]
+
+numeric_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler()),
+    ("poly", PolynomialFeatures(degree=2, interaction_only=True, include_bias=False))
 ])
-categorical_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+cat_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
 ])
-preprocessor = ColumnTransformer(transformers=[
-    ('num', numerical_transformer, numerical_columns),
-    ('cat', categorical_transformer, categorical_columns)
-])
-model = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('regressor', RandomForestRegressor(
-        n_estimators=100, 
-        max_depth=10,  # Limite la profondeur des arbres
-        min_samples_split=10,  # Minimum d'échantillons pour diviser un nœud
-        min_samples_leaf=5,  # Minimum d'échantillons par feuille
-        random_state=42
-    ))
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipe, num_feats),
+    ("cat", cat_pipe, cat_feats)
 ])
 
-# Train/test split
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# 6. Pipeline XGBoost avec RandomizedSearchCV
+pipeline = Pipeline([
+    ("preproc", preprocessor),
+    ("model", XGBRegressor(objective="reg:squarederror", random_state=42, n_jobs=-1))
+])
+param_dist = {
+    "model__n_estimators": stats.randint(100, 400),
+    "model__max_depth": stats.randint(3, 12),
+    "model__learning_rate": stats.uniform(0.01, 0.3),
+    "model__subsample": stats.uniform(0.6, 0.4),
+    "model__colsample_bytree": stats.uniform(0.6, 0.4),
+    "model__reg_alpha": stats.uniform(0, 1),
+    "model__reg_lambda": stats.uniform(0, 1)
+}
+search = RandomizedSearchCV(
+    pipeline, param_dist,
+    n_iter=15, cv=3, scoring="r2",
+    random_state=42, n_jobs=-1, verbose=1
+)
 
-cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2')
-print(f"Scores de validation croisée : {cv_scores}")
-print(f"R² moyen (validation croisée) : {np.mean(cv_scores):.4f}")
+# 7. Entraînement et hyperparam tuning
+search.fit(X_train, y_train)
+print("Meilleurs paramètres :", search.best_params_)
 
+# 8. Évaluation du modèle
+for name, (X_set, y_set) in zip(["Train", "Validation"], [(X_train, y_train), (X_val, y_val)]):
+    preds = search.predict(X_set)
+    rmse = np.sqrt(mean_squared_error(y_set, preds))
+    r2 = r2_score(y_set, preds)
+    print(f"{name} — R²: {r2:.4f}, RMSE: {rmse:.4f}")
 
-# Entraînement
-model.fit(X_train, y_train)
+# 9. Prédiction finale
+test_df = pd.read_csv("airbnb_test.csv")
+test_df, _ = process_amenities(test_df, top_n=20)
 
-# Évaluation
-def evaluate_model(y_true, y_pred):
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
-    print(f"RMSE: {rmse:.4f}")
-    print(f"R²: {r2:.4f}")
+# Appliquer les mêmes transformations sur test_df
+test_df["accommodates_per_bathroom"] = test_df["accommodates"] / (test_df["bathrooms"] + 1e-6)
+test_df["bedrooms_per_accommodates"] = test_df["bedrooms"] / (test_df["accommodates"] + 1e-6)
+test_df["beds_per_bedroom"] = test_df["beds"] / (test_df["bedrooms"] + 1e-6)
+test_df["price_per_accommodate"] = test_df["cleaning_fee"] / (test_df["accommodates"] + 1e-6)
+test_df["bathrooms_per_bedroom"] = test_df["bathrooms"] / (test_df["bedrooms"] + 1e-6)
+test_df["log_bedrooms"] = np.log1p(test_df["bedrooms"])
+test_df["log_accommodates"] = np.log1p(test_df["accommodates"])
+test_df["log_bathrooms"] = np.log1p(test_df["bathrooms"])
+test_df["cleaning_fee_indicator"] = (test_df["cleaning_fee"] > 0).astype(int)
+test_df["has_reviews"] = (test_df["review_scores_rating"] > 0).astype(int)
+test_df["is_shared_room"] = (test_df["room_type"] == "Shared room").astype(int)
+test_df["city"] = test_df["city"].replace(rare_cities, "Other")
 
-print("\n=== Évaluation sur l'ensemble d'entraînement ===")
-evaluate_model(y_train, model.predict(X_train))
+# Préparer les données pour la prédiction
+X_test = test_df[features].copy()
+X_test[cat_feats] = X_test[cat_feats].astype(str)
+preds_final = search.predict(X_test)
 
-print("\n=== Évaluation sur l'ensemble de test ===")
-evaluate_model(y_test, model.predict(X_test))
+submission = pd.read_csv("prediction_example.csv")
+submission[submission.columns[1]] = preds_final
+submission.to_csv("MaPredictionFinale.csv", index=False)
+print("MaPredictionFinale.csv généré !")
 
-# Prédictions finales
-airbnb_test = pd.read_csv("airbnb_test.csv")
-airbnb_test, _ = process_amenities_column(airbnb_test, top_n=20)
-final_X_test = airbnb_test[selected_columns].copy()
-final_X_test[categorical_columns] = final_X_test[categorical_columns].astype(str)
-y_final_prediction = model.predict(final_X_test)
-
-# Sauvegarde des prédictions
-prediction_example = pd.read_csv("prediction_example.csv")
-prediction_example["logpred"] = y_final_prediction
-prediction_example.to_csv("MaPredictionFinale.csv", index=False)
-print("\nFichier de prédictions sauvegardé sous le nom 'MaPredictionFinale.csv'.")
-
-# Vérification
-def estConforme(monFichier_csv):
-    votre_prediction = pd.read_csv(monFichier_csv)
-    fichier_exemple = pd.read_csv("prediction_example.csv")
-    assert votre_prediction.columns[1] == fichier_exemple.columns[1], \
-        f"Votre colonne de prédiction doit s'appeler {fichier_exemple.columns[1]}"
-    assert len(votre_prediction) == len(fichier_exemple), \
-        f"Vous devriez avoir {len(fichier_exemple)} prédictions"
-    assert np.all(votre_prediction.iloc[:, 0] == fichier_exemple.iloc[:, 0])
-    print("Fichier conforme!")
+# 10. Vérification de conformité
+def estConforme(fpath):
+    pred = pd.read_csv(fpath)
+    example = pd.read_csv("prediction_example.csv")
+    assert pred.columns[1] == example.columns[1]
+    assert len(pred) == len(example)
+    assert np.all(pred.iloc[:, 0] == example.iloc[:, 0])
+    print("Fichier conforme !")
 
 estConforme("MaPredictionFinale.csv")
