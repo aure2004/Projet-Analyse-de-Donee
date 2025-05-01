@@ -1,152 +1,100 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold
-from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from xgboost import XGBRegressor
-import scipy.stats as stats
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
-# Chargement des données
-airbnb = pd.read_csv("airbnb_train.csv")
+def data_processing_and_viz(filepath):
+    # 1. Chargement du jeu de données
+    data = pd.read_csv(filepath)
 
-# Création de log_price si absent
-if "log_price" not in airbnb.columns:
-    airbnb["log_price"] = np.log1p(airbnb["price"])
+    # 2. Prix / log-prix
+    if 'log_price' in data.columns:
+        data['price'] = np.expm1(data['log_price'])
+    else:
+        data['log_price'] = np.log1p(data['price'])
 
-# Traitement des amenities
-def process_amenities_column(df, top_n=20):
-    df = df.copy()
-    df["amenities"] = df["amenities"].fillna("[]")
-    all_amenities = df["amenities"].str.replace(r"[{}\"]", "", regex=True).str.split(",")
-    amenities_flat = [item.strip() for sublist in all_amenities for item in sublist]
-    top_amenities = pd.Series(amenities_flat).value_counts().head(top_n).index.tolist()
-    for amenity in top_amenities:
-        df[f"amenity_{amenity}"] = all_amenities.apply(lambda x: int(amenity in x))
-    return df, [f"amenity_{a}" for a in top_amenities]
+    # 3. Aperçu rapide
+    print(f"Jeu de données : {data.shape[0]} lignes × {data.shape[1]} colonnes")
+    print("\nValeurs manquantes par colonne :")
+    print(data.isnull().sum())
 
-# Application à l'entraînement
-airbnb, amenity_columns = process_amenities_column(airbnb, top_n=20)
+    # 4. Histogrammes du prix
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.hist(data['price'].dropna(), bins=40, edgecolor='black')
+    plt.title('Prix brut')
+    plt.xlabel('Prix (€)')
+    plt.ylabel('Effectif')
+    plt.subplot(1,2,2)
+    plt.hist(data['log_price'].dropna(), bins=40, edgecolor='black')
+    plt.title('Log-prix')
+    plt.xlabel('Log(prix)')
+    plt.ylabel('Effectif')
+    plt.tight_layout()
+    plt.show()
 
-# Réduction de la cardinalité des colonnes catégoriques
-def reduce_cardinality(df, column, threshold=50):
-    value_counts = df[column].value_counts()
-    rare_categories = value_counts[value_counts < threshold].index
-    df[column] = df[column].replace(rare_categories, "Other")
-    return df
+    # 5. Extraction manuelle des amenities et encodage binaire
+    #    On retire les accolades & guillemets, on split sur la virgule
+    raw = (data['amenities']
+           .fillna('[]')
+           .str.replace(r'[\{\}"]', '', regex=True)
+           .str.split(',')
+           .apply(lambda lst: [x.strip() for x in lst if x.strip()]))
+    flat = pd.Series([item for sublist in raw for item in sublist])
+    top_25 = flat.value_counts().head(25).index.tolist()
+    for amenity in top_25:
+        col_name = 'has_' + amenity.replace(' ', '_')
+        data[col_name] = raw.apply(lambda lst: int(amenity in lst))
 
-airbnb = reduce_cardinality(airbnb, "city", threshold=50)
-airbnb = reduce_cardinality(airbnb, "property_type", threshold=50)
+    # 6. Regroupement des petites villes
+    city_counts = data['city'].value_counts()
+    small = city_counts[city_counts < 75].index
+    data['city_cat'] = data['city'].where(~data['city'].isin(small), 'Other')
 
-# Sélection des colonnes
-selected_columns = [
-    "accommodates", "bedrooms", "beds", "bed_type", "room_type", "bathrooms",
-    "cleaning_fee", "city", "review_scores_rating", "instant_bookable",
-    "cancellation_policy", "property_type",
-] + amenity_columns
+    # 7. Création de features supplémentaires
+    data['price_per_guest']   = data['price'] / data['accommodates']
+    data['beds_per_bedroom']  = data['beds'] / (data['bedrooms'] + 1e-6)
+    data['bath_per_bed_ratio'] = data['bathrooms'] / (data['beds'] + 1e-6)
 
-# Création de nouvelles variables combinées
-airbnb["accommodates_per_bedroom"] = airbnb["accommodates"] / (airbnb["bedrooms"] + 1e-6)
-airbnb["bathrooms_per_bedroom"] = airbnb["bathrooms"] / (airbnb["bedrooms"] + 1e-6)
-airbnb["log_bedrooms"] = np.log1p(airbnb["bedrooms"])
-airbnb["log_bathrooms"] = np.log1p(airbnb["bathrooms"])
-airbnb["bed_bath_ratio"] = airbnb["beds"] / (airbnb["bathrooms"] + 1e-6)
-airbnb["bedroom_bathroom_product"] = airbnb["bedrooms"] * airbnb["bathrooms"]
+    # 8. Clustering géographique (5 clusters)
+    coords = data[['latitude','longitude']].dropna()
+    scaler = StandardScaler()
+    coords_norm = scaler.fit_transform(coords)
+    kmeans = KMeans(n_clusters=5, random_state=0).fit(coords_norm)
+    data.loc[coords.index, 'geo_group'] = kmeans.labels_
 
-X = airbnb[selected_columns + [
-    "accommodates_per_bedroom", "bathrooms_per_bedroom", "log_bedrooms",
-    "log_bathrooms", "bed_bath_ratio", "bedroom_bathroom_product"
-]]
-y = airbnb["log_price"]
+    # 9. Visualisation des clusters
+    plt.figure(figsize=(6,6))
+    for grp in sorted(data['geo_group'].unique()):
+        subset = data[data['geo_group'] == grp]
+        plt.scatter(
+            subset['longitude'], subset['latitude'],
+            s=10, alpha=0.6,
+            label=f'Cluster {grp}'
+        )
+    plt.legend()
+    plt.title('Groupes géographiques')
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.show()
 
-# Séparation des colonnes numériques / catégoriques
-numerical_columns = [
-    "accommodates", "bedrooms", "beds", "bathrooms", "review_scores_rating",
-    "accommodates_per_bedroom", "bathrooms_per_bedroom", "log_bedrooms",
-    "log_bathrooms", "bed_bath_ratio", "bedroom_bathroom_product"
-] + amenity_columns
-categorical_columns = list(set(selected_columns) - set(numerical_columns))
+    # 10. Carte de corrélation des variables numériques
+    features = [
+        'accommodates','bedrooms','beds','bathrooms','review_scores_rating',
+        'price_per_guest','beds_per_bedroom','bath_per_bed_ratio','log_price'
+    ]
+    corr_matrix = data[features].corr()
+    plt.figure(figsize=(8,6))
+    plt.imshow(corr_matrix, interpolation='nearest')
+    plt.colorbar(shrink=0.8)
+    plt.xticks(range(len(features)), features, rotation=90)
+    plt.yticks(range(len(features)), features)
+    plt.title('Matrice de corrélation')
+    plt.tight_layout()
+    plt.show()
 
-# Pipelines
-numerical_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='median')),
-    ('scaler', StandardScaler()),
-    ('poly', PolynomialFeatures(degree=2, interaction_only=True, include_bias=False))
-])
-categorical_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-    ('onehot', OneHotEncoder(handle_unknown='ignore'))
-])
-preprocessor = ColumnTransformer(transformers=[
-    ('num', numerical_transformer, numerical_columns),
-    ('cat', categorical_transformer, categorical_columns)
-])
+    return data
 
-# Modèle XGBoost avec optimisation des hyperparamètres
-model = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('regressor', XGBRegressor(objective="reg:squarederror", random_state=42, n_jobs=-1))
-])
-
-param_dist = {
-    "regressor__n_estimators": stats.randint(100, 500),
-    "regressor__max_depth": stats.randint(3, 12),
-    "regressor__learning_rate": stats.uniform(0.01, 0.3),
-    "regressor__subsample": stats.uniform(0.6, 0.4),
-    "regressor__colsample_bytree": stats.uniform(0.6, 0.4),
-    "regressor__reg_alpha": stats.uniform(0, 1),
-    "regressor__reg_lambda": stats.uniform(0, 1)
-}
-
-search = RandomizedSearchCV(
-    model, param_distributions=param_dist,
-    n_iter=50, cv=KFold(10, shuffle=True, random_state=42),
-    scoring="r2", random_state=42, n_jobs=-1, verbose=1
-)
-
-# Train/test split
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Entraînement avec RandomizedSearchCV
-search.fit(X_train, y_train)
-print("Meilleurs paramètres :", search.best_params_)
-
-# Évaluation
-def evaluate_model(y_true, y_pred):
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
-    print(f"RMSE: {rmse:.4f}")
-    print(f"R²: {r2:.4f}")
-
-print("\n=== Évaluation sur l'ensemble d'entraînement ===")
-evaluate_model(y_train, search.predict(X_train))
-
-print("\n=== Évaluation sur l'ensemble de test ===")
-evaluate_model(y_test, search.predict(X_test))
-
-# Prédictions finales
-airbnb_test = pd.read_csv("airbnb_test.csv")
-airbnb_test, _ = process_amenities_column(airbnb_test, top_n=20)
-airbnb_test = reduce_cardinality(airbnb_test, "city", threshold=50)
-airbnb_test = reduce_cardinality(airbnb_test, "property_type", threshold=50)
-airbnb_test["accommodates_per_bedroom"] = airbnb_test["accommodates"] / (airbnb_test["bedrooms"] + 1e-6)
-airbnb_test["bathrooms_per_bedroom"] = airbnb_test["bathrooms"] / (airbnb_test["bedrooms"] + 1e-6)
-airbnb_test["log_bedrooms"] = np.log1p(airbnb_test["bedrooms"])
-airbnb_test["log_bathrooms"] = np.log1p(airbnb_test["bathrooms"])
-airbnb_test["bed_bath_ratio"] = airbnb_test["beds"] / (airbnb_test["bathrooms"] + 1e-6)
-airbnb_test["bedroom_bathroom_product"] = airbnb_test["bedrooms"] * airbnb_test["bathrooms"]
-
-final_X_test = airbnb_test[selected_columns + [
-    "accommodates_per_bedroom", "bathrooms_per_bedroom", "log_bedrooms",
-    "log_bathrooms", "bed_bath_ratio", "bedroom_bathroom_product"
-]].copy()
-final_X_test[categorical_columns] = final_X_test[categorical_columns].astype(str)
-y_final_prediction = search.predict(final_X_test)
-
-# Sauvegarde des prédictions
-prediction_example = pd.read_csv("prediction_example.csv")
-prediction_example["logpred"] = y_final_prediction
-prediction_example.to_csv("MaPredictionFinale.csv", index=False)
-print("\nFichier de prédictions sauvegardé sous le nom 'MaPredictionFinale.csv'.")
+if __name__ == "__main__":
+    df = data_processing_and_viz('airbnb_train.csv')
